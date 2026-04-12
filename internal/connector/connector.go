@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -59,18 +61,49 @@ func DefaultOptions() Options {
 }
 
 func Open(target string, opts ...Option) (DB, error) {
-	if strings.HasPrefix(target, "file://") {
-		return openLocal(strings.TrimPrefix(target, "file://"))
-	}
-	if strings.Contains(target, "/") || strings.Contains(target, "\\") || strings.HasSuffix(target, ".db") {
-		return openLocal(target)
-	}
-
 	o := DefaultOptions()
 	for _, opt := range opts {
 		opt(&o)
 	}
+
+	if isLocal(target) {
+		return openLocal(ensureCurrentDir(target))
+	}
+
 	return openRemote(target, o)
+}
+
+func isLocal(target string) bool {
+	if strings.HasPrefix(target, "file://") {
+		return true
+	}
+	if strings.HasSuffix(target, ".db") {
+		return true
+	}
+	if strings.Contains(target, "/") || strings.Contains(target, "\\") {
+		return true
+	}
+	if !strings.Contains(target, ":") {
+		return true
+	}
+	return false
+}
+
+func ensureCurrentDir(path string) string {
+	path = strings.TrimPrefix(path, "file://")
+
+	if filepath.IsAbs(path) {
+		path = filepath.Base(path)
+	}
+
+	path = strings.TrimPrefix(path, "/")
+	path = strings.TrimPrefix(path, "\\")
+
+	pwd, err := os.Getwd()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(pwd, path)
 }
 
 type Connector struct {
