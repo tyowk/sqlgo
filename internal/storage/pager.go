@@ -16,10 +16,10 @@ const (
 	HeaderSize       = 100
 	MagicString      = "SQLGO"
 	MagicSize        = 8
-	FileVersion      = 2
+	FileVersion      = 3
 	InvalidPage      = ^uint32(0)
-	DefaultCacheSize = 1024
-	walBufSize       = 64
+	DefaultCacheSize = 2048
+	walBufSize       = 128
 )
 
 var (
@@ -42,6 +42,7 @@ type Page struct {
 	ID    uint32
 	Data  [PageSize]byte
 	Dirty bool
+	pins  int32
 }
 
 func (p *Page) Type() PageType     { return PageType(p.Data[0]) }
@@ -107,6 +108,10 @@ func (p *Page) InsertCellPointer(idx uint16, ptr uint16) {
 	p.SetCellPointer(idx, ptr)
 }
 
+func (p *Page) Pin()         { atomic.AddInt32(&p.pins, 1) }
+func (p *Page) Unpin()       { atomic.AddInt32(&p.pins, -1) }
+func (p *Page) Pinned() bool { return atomic.LoadInt32(&p.pins) > 0 }
+
 type DBHeader struct {
 	Magic      [MagicSize]byte
 	Version    uint32
@@ -150,9 +155,12 @@ type lruEntry struct {
 }
 
 type lruCache struct {
-	cap   int
-	items map[uint32]*list.Element
-	order *list.List
+	mu     sync.Mutex
+	cap    int
+	items  map[uint32]*list.Element
+	order  *list.List
+	hits   int64
+	misses int64
 }
 
 func newLRUCache(cap int) *lruCache {
@@ -164,27 +172,41 @@ func newLRUCache(cap int) *lruCache {
 }
 
 func (c *lruCache) get(id uint32) (*Page, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if el, ok := c.items[id]; ok {
 		c.order.MoveToFront(el)
+		atomic.AddInt64(&c.hits, 1)
 		return el.Value.(*lruEntry).page, true
 	}
+	atomic.AddInt64(&c.misses, 1)
 	return nil, false
 }
 
 func (c *lruCache) put(id uint32, pg *Page) *Page {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if el, ok := c.items[id]; ok {
 		c.order.MoveToFront(el)
 		el.Value.(*lruEntry).page = pg
 		return nil
 	}
 	var evicted *Page
-	if c.order.Len() >= c.cap {
+	for c.order.Len() >= c.cap {
 		el := c.order.Back()
-		if el != nil {
-			entry := el.Value.(*lruEntry)
-			delete(c.items, entry.id)
-			c.order.Remove(el)
-			evicted = entry.page
+		if el == nil {
+			break
+		}
+		entry := el.Value.(*lruEntry)
+		if entry.page.Pinned() {
+			c.order.MoveToFront(el)
+			break
+		}
+		delete(c.items, entry.id)
+		c.order.Remove(el)
+		evicted = entry.page
+		if true {
+			break
 		}
 	}
 	el := c.order.PushFront(&lruEntry{id: id, page: pg})
@@ -193,6 +215,8 @@ func (c *lruCache) put(id uint32, pg *Page) *Page {
 }
 
 func (c *lruCache) all() []*Page {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	pages := make([]*Page, 0, c.order.Len())
 	for el := c.order.Front(); el != nil; el = el.Next() {
 		pages = append(pages, el.Value.(*lruEntry).page)
@@ -201,20 +225,35 @@ func (c *lruCache) all() []*Page {
 }
 
 func (c *lruCache) remove(id uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if el, ok := c.items[id]; ok {
 		delete(c.items, id)
 		c.order.Remove(el)
 	}
 }
 
+func (c *lruCache) hitRate() float64 {
+	h := atomic.LoadInt64(&c.hits)
+	m := atomic.LoadInt64(&c.misses)
+	if h+m == 0 {
+		return 0
+	}
+	return float64(h) / float64(h+m)
+}
+
 type Pager struct {
-	mu         sync.RWMutex
-	file       *os.File
-	header     *DBHeader
-	cache      *lruCache
-	walBuf     map[uint32]*Page
-	walMu      sync.Mutex
-	dirtyCount int64
+	mu          sync.RWMutex
+	file        *os.File
+	header      *DBHeader
+	cache       *lruCache
+	walBuf      map[uint32]*Page
+	walMu       sync.Mutex
+	dirtyCount  int64
+	freePages   []uint32
+	freeMu      sync.Mutex
+	totalReads  int64
+	totalWrites int64
 }
 
 func NewPager(path string) (*Pager, error) {
@@ -283,8 +322,7 @@ func (p *Pager) loadHeader() error {
 	if err != nil {
 		return err
 	}
-	magic := string(h.Magic[:len(MagicString)])
-	if magic != MagicString {
+	if string(h.Magic[:len(MagicString)]) != MagicString {
 		return ErrCorruptedDB
 	}
 	p.header = h
@@ -294,13 +332,9 @@ func (p *Pager) loadHeader() error {
 func (p *Pager) Header() *DBHeader { return p.header }
 
 func (p *Pager) GetPage(id uint32) (*Page, error) {
-	p.mu.RLock()
 	if pg, ok := p.cache.get(id); ok {
-		p.mu.RUnlock()
 		return pg, nil
 	}
-	p.mu.RUnlock()
-
 	p.walMu.Lock()
 	if pg, ok := p.walBuf[id]; ok {
 		p.walMu.Unlock()
@@ -310,6 +344,7 @@ func (p *Pager) GetPage(id uint32) (*Page, error) {
 
 	pg := &Page{ID: id}
 	offset := int64(id) * PageSize
+	atomic.AddInt64(&p.totalReads, 1)
 	n, err := p.file.ReadAt(pg.Data[:], offset)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("read page %d: %w", id, err)
@@ -317,11 +352,7 @@ func (p *Pager) GetPage(id uint32) (*Page, error) {
 	if n == 0 {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidPage, id)
 	}
-
-	p.mu.Lock()
 	evicted := p.cache.put(id, pg)
-	p.mu.Unlock()
-
 	if evicted != nil && evicted.Dirty {
 		if err := p.writePage(evicted); err != nil {
 			return nil, err
@@ -331,13 +362,29 @@ func (p *Pager) GetPage(id uint32) (*Page, error) {
 }
 
 func (p *Pager) AllocatePage() (*Page, error) {
+	p.freeMu.Lock()
+	if len(p.freePages) > 0 {
+		id := p.freePages[len(p.freePages)-1]
+		p.freePages = p.freePages[:len(p.freePages)-1]
+		p.freeMu.Unlock()
+		pg := &Page{ID: id}
+		evicted := p.cache.put(id, pg)
+		if evicted != nil && evicted.Dirty {
+			if err := p.writePage(evicted); err != nil {
+				return nil, err
+			}
+		}
+		return pg, nil
+	}
+	p.freeMu.Unlock()
+
 	p.mu.Lock()
 	id := p.header.PageCount
 	p.header.PageCount++
-	pg := &Page{ID: id}
-	evicted := p.cache.put(id, pg)
 	p.mu.Unlock()
 
+	pg := &Page{ID: id}
+	evicted := p.cache.put(id, pg)
 	if evicted != nil && evicted.Dirty {
 		if err := p.writePage(evicted); err != nil {
 			return nil, err
@@ -346,10 +393,16 @@ func (p *Pager) AllocatePage() (*Page, error) {
 	return pg, nil
 }
 
+func (p *Pager) FreePage(id uint32) {
+	p.freeMu.Lock()
+	p.freePages = append(p.freePages, id)
+	p.freeMu.Unlock()
+	p.cache.remove(id)
+}
+
 func (p *Pager) MarkDirty(pg *Page) {
 	pg.Dirty = true
-	atomic.AddInt64(&p.dirtyCount, 1)
-	if atomic.LoadInt64(&p.dirtyCount) >= walBufSize {
+	if atomic.AddInt64(&p.dirtyCount, 1) >= walBufSize {
 		go func() {
 			_ = p.flushWAL()
 			atomic.StoreInt64(&p.dirtyCount, 0)
@@ -377,6 +430,7 @@ func (p *Pager) flushWAL() error {
 
 func (p *Pager) writePage(pg *Page) error {
 	offset := int64(pg.ID) * PageSize
+	atomic.AddInt64(&p.totalWrites, 1)
 	if _, err := p.file.WriteAt(pg.Data[:], offset); err != nil {
 		return fmt.Errorf("write page %d: %w", pg.ID, err)
 	}
@@ -396,9 +450,8 @@ func (p *Pager) FlushAll() error {
 		p.mu.Unlock()
 		return err
 	}
-	pages := p.cache.all()
 	p.mu.Unlock()
-
+	pages := p.cache.all()
 	for _, pg := range pages {
 		if pg.Dirty {
 			if err := p.writePage(pg); err != nil {
@@ -417,3 +470,13 @@ func (p *Pager) Close() error {
 }
 
 func (p *Pager) PageCount() uint32 { return p.header.PageCount }
+
+func (p *Pager) Stats() map[string]interface{} {
+	return map[string]interface{}{
+		"page_count":     p.header.PageCount,
+		"cache_hit_rate": p.cache.hitRate(),
+		"total_reads":    atomic.LoadInt64(&p.totalReads),
+		"total_writes":   atomic.LoadInt64(&p.totalWrites),
+		"free_pages":     len(p.freePages),
+	}
+}

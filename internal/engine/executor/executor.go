@@ -2,35 +2,52 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/tyowk/sqlgo/parser"
-	"github.com/tyowk/sqlgo/storage"
+	"github.com/tyowk/sqlgo/internal/engine/parser"
+	"github.com/tyowk/sqlgo/internal/storage"
 )
 
 type ResultSet struct {
-	Columns []string
-	Rows    [][]string
+	Columns      []string
+	Rows         [][]string
+	RowsAffected int64
+	LastInsertID int64
+	Duration     time.Duration
+}
+
+type queryPlan struct {
+	useIndex  bool
+	indexName string
+	filterKey string
+	filterVal string
 }
 
 type Executor struct {
-	pager  *storage.Pager
-	schema *storage.SchemaManager
-	table  *storage.TableEngine
-	inTx   bool
-	tx     *storage.Transaction
+	pager     *storage.Pager
+	schema    *storage.SchemaManager
+	table     *storage.TableEngine
+	inTx      bool
+	tx        *storage.Transaction
+	mu        sync.RWMutex
+	planCache map[string]*queryPlan
 }
 
 func NewExecutor(pager *storage.Pager, schema *storage.SchemaManager) *Executor {
 	return &Executor{
-		pager:  pager,
-		schema: schema,
-		table:  storage.NewTableEngine(pager, schema),
+		pager:     pager,
+		schema:    schema,
+		table:     storage.NewTableEngine(pager, schema),
+		planCache: make(map[string]*queryPlan, 64),
 	}
 }
 
 func (e *Executor) Execute(sql string) (*ResultSet, error) {
+	start := time.Now()
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err
@@ -42,6 +59,9 @@ func (e *Executor) Execute(sql string) (*ResultSet, error) {
 			return nil, err
 		}
 		last = rs
+	}
+	if last != nil {
+		last.Duration = time.Since(start)
 	}
 	return last, nil
 }
@@ -160,16 +180,9 @@ func (e *Executor) execCompound(stmt *parser.SelectStmt) (*ResultSet, error) {
 		if stmt.Compound.All {
 			leftRS.Rows = append(leftRS.Rows, rightRS.Rows...)
 		} else {
-			seen := make(map[string]bool)
+			seen := make(map[string]bool, len(leftRS.Rows)+len(rightRS.Rows))
 			var merged [][]string
-			for _, row := range leftRS.Rows {
-				key := strings.Join(row, "\x00")
-				if !seen[key] {
-					seen[key] = true
-					merged = append(merged, row)
-				}
-			}
-			for _, row := range rightRS.Rows {
+			for _, row := range append(leftRS.Rows, rightRS.Rows...) {
 				key := strings.Join(row, "\x00")
 				if !seen[key] {
 					seen[key] = true
@@ -179,7 +192,7 @@ func (e *Executor) execCompound(stmt *parser.SelectStmt) (*ResultSet, error) {
 			leftRS.Rows = merged
 		}
 	case "INTERSECT":
-		rightSet := make(map[string]bool)
+		rightSet := make(map[string]bool, len(rightRS.Rows))
 		for _, row := range rightRS.Rows {
 			rightSet[strings.Join(row, "\x00")] = true
 		}
@@ -191,7 +204,7 @@ func (e *Executor) execCompound(stmt *parser.SelectStmt) (*ResultSet, error) {
 		}
 		leftRS.Rows = result
 	case "EXCEPT":
-		rightSet := make(map[string]bool)
+		rightSet := make(map[string]bool, len(rightRS.Rows))
 		for _, row := range rightRS.Rows {
 			rightSet[strings.Join(row, "\x00")] = true
 		}
@@ -214,20 +227,7 @@ func (e *Executor) evalSelect(stmt *parser.SelectStmt, cteMap map[string]*cteRes
 	if err != nil {
 		return nil, nil, err
 	}
-	var filtered []*rowWithValues
-	for _, row := range allRows {
-		if stmt.Where != nil {
-			ctx := e.makeCtxForRow(row, mainSchema, tableAliases)
-			val, err := EvalExpr(ctx, stmt.Where)
-			if err != nil {
-				return nil, nil, err
-			}
-			if !IsTruthy(val) {
-				continue
-			}
-		}
-		filtered = append(filtered, row)
-	}
+	filtered := e.filterRows(allRows, stmt.Where, mainSchema, tableAliases)
 	if len(stmt.GroupBy) > 0 {
 		return e.evalGroupBy(stmt, filtered, mainSchema, tableAliases)
 	}
@@ -243,7 +243,7 @@ func (e *Executor) evalSelect(stmt *parser.SelectStmt, cteMap map[string]*cteRes
 		}
 		return result, colNames, nil
 	}
-	var result []*rowWithValues
+	result := make([]*rowWithValues, 0, len(filtered))
 	for _, row := range filtered {
 		ctx := e.makeCtxForRow(row, mainSchema, tableAliases)
 		projected, err := e.projectRow(ctx, stmt)
@@ -263,6 +263,21 @@ func (e *Executor) evalSelect(stmt *parser.SelectStmt, cteMap map[string]*cteRes
 	}
 	result = applyLimitOffset(stmt, result)
 	return result, colNames, nil
+}
+
+func (e *Executor) filterRows(rows []*rowWithValues, where parser.Expr, schema *storage.TableSchema, aliases map[string]*tableBinding) []*rowWithValues {
+	if where == nil {
+		return rows
+	}
+	out := rows[:0]
+	for _, row := range rows {
+		ctx := e.makeCtxForRow(row, schema, aliases)
+		val, err := EvalExpr(ctx, where)
+		if err == nil && IsTruthy(val) {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func (e *Executor) evalSelectNoFrom(stmt *parser.SelectStmt) ([]*rowWithValues, []string, error) {
@@ -299,9 +314,9 @@ func (e *Executor) getTableRows(name string, cteMap map[string]*cteResult) ([]sc
 			for _, col := range cte.columns {
 				fakeSchema.Columns = append(fakeSchema.Columns, storage.Column{Name: col, Type: storage.TypeText})
 			}
-			var rows []scanRow
+			rows := make([]scanRow, len(cte.rows))
 			for i, r := range cte.rows {
-				rows = append(rows, scanRow{Row: &storage.Row{Values: r.values}, RowID: int64(i + 1)})
+				rows[i] = scanRow{Row: &storage.Row{Values: r.values}, RowID: int64(i + 1)}
 			}
 			return rows, fakeSchema, nil
 		}
@@ -326,9 +341,9 @@ func (e *Executor) getTableRows(name string, cteMap map[string]*cteResult) ([]sc
 		for _, col := range colNames {
 			fakeSchema.Columns = append(fakeSchema.Columns, storage.Column{Name: col, Type: storage.TypeText})
 		}
-		var result []scanRow
+		result := make([]scanRow, len(rows))
 		for i, r := range rows {
-			result = append(result, scanRow{Row: &storage.Row{Values: r.values}, RowID: int64(i + 1)})
+			result[i] = scanRow{Row: &storage.Row{Values: r.values}, RowID: int64(i + 1)}
 		}
 		return result, fakeSchema, nil
 	}
@@ -340,9 +355,9 @@ func (e *Executor) getTableRows(name string, cteMap map[string]*cteResult) ([]sc
 	if !ok {
 		return nil, nil, fmt.Errorf("table '%s' does not exist", name)
 	}
-	var rows []scanRow
-	for _, sr := range scans {
-		rows = append(rows, scanRow{Row: sr.Row, RowID: sr.RowID})
+	rows := make([]scanRow, len(scans))
+	for i, sr := range scans {
+		rows[i] = scanRow{Row: sr.Row, RowID: sr.RowID}
 	}
 	return rows, ts, nil
 }
@@ -357,8 +372,8 @@ func (e *Executor) gatherRows(stmt *parser.SelectStmt, cteMap map[string]*cteRes
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	tableAliases := map[string]*tableBinding{}
-	var allRows []*rowWithValues
+	tableAliases := make(map[string]*tableBinding, len(stmt.From)+len(stmt.Joins))
+	allRows := make([]*rowWithValues, 0, len(mainRows))
 	for _, sr := range mainRows {
 		binding := &tableBinding{Schema: mainSchema, Row: sr.Row, RowID: sr.RowID}
 		tableAliases[strings.ToLower(alias)] = binding
@@ -369,21 +384,20 @@ func (e *Executor) gatherRows(stmt *parser.SelectStmt, cteMap map[string]*cteRes
 		if alias2 == "" {
 			alias2 = from.Name
 		}
-		rows2, schema2, err := e.getTableRows(from.Name, cteMap)
+		rows2, _, err := e.getTableRows(from.Name, cteMap)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		var crossed []*rowWithValues
+		crossed := make([]*rowWithValues, 0, len(allRows)*len(rows2))
 		for _, r1 := range allRows {
 			for _, r2 := range rows2 {
 				combined := &rowWithValues{
-					values: append(append([]*storage.Value{}, r1.values...), r2.Row.Values...),
+					values: append(append(make([]*storage.Value, 0, len(r1.values)+len(r2.Row.Values)), r1.values...), r2.Row.Values...),
 				}
 				crossed = append(crossed, combined)
 			}
 		}
 		allRows = crossed
-		_ = schema2
 		_ = alias2
 	}
 	for _, join := range stmt.Joins {
@@ -404,12 +418,16 @@ func (e *Executor) applyJoin(leftRows []*rowWithValues, join parser.JoinClause, 
 	if err != nil {
 		return nil, err
 	}
-	var result []*rowWithValues
+	result := make([]*rowWithValues, 0, len(leftRows))
+	nulls := make([]*storage.Value, len(rightSchema.Columns))
+	for i := range nulls {
+		nulls[i] = storage.NullValue
+	}
 	for _, leftRow := range leftRows {
 		matched := false
 		for _, rightRow := range rightRows {
 			combined := &rowWithValues{
-				values: append(append([]*storage.Value{}, leftRow.values...), rightRow.Row.Values...),
+				values: append(append(make([]*storage.Value, 0, len(leftRow.values)+len(rightRow.Row.Values)), leftRow.values...), rightRow.Row.Values...),
 			}
 			rightBinding := &tableBinding{Schema: rightSchema, Row: rightRow.Row, RowID: rightRow.RowID}
 			tableAliases[strings.ToLower(alias)] = rightBinding
@@ -440,12 +458,8 @@ func (e *Executor) applyJoin(leftRows []*rowWithValues, join parser.JoinClause, 
 			}
 		}
 		if !matched && strings.Contains(join.Type, "LEFT") {
-			nulls := make([]*storage.Value, len(rightSchema.Columns))
-			for i := range nulls {
-				nulls[i] = storage.NullValue
-			}
 			result = append(result, &rowWithValues{
-				values: append(append([]*storage.Value{}, leftRow.values...), nulls...),
+				values: append(append(make([]*storage.Value, 0, len(leftRow.values)+len(nulls)), leftRow.values...), nulls...),
 			})
 		}
 	}
@@ -464,8 +478,7 @@ func getValueFromRow(values []*storage.Value, schema *storage.TableSchema, col s
 }
 
 func (e *Executor) makeCtxForRow(row *rowWithValues, schema *storage.TableSchema, tableAliases map[string]*tableBinding) *EvalContext {
-	fakeRow := &storage.Row{Values: row.values}
-	return &EvalContext{Row: fakeRow, Schema: schema, Tables: tableAliases}
+	return &EvalContext{Row: &storage.Row{Values: row.values}, Schema: schema, Tables: tableAliases}
 }
 
 func (e *Executor) projectRow(ctx *EvalContext, stmt *parser.SelectStmt) (*rowWithValues, error) {
@@ -544,7 +557,8 @@ func containsAggregate(expr parser.Expr) bool {
 	case *parser.FuncCallExpr:
 		fn := strings.ToUpper(e.Name)
 		switch fn {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT":
+		case "COUNT", "SUM", "AVG", "MIN", "MAX", "TOTAL", "GROUP_CONCAT",
+			"STDDEV", "VARIANCE", "BIT_AND", "BIT_OR", "BIT_XOR":
 			return true
 		}
 	case *parser.BinaryExpr:
@@ -561,14 +575,20 @@ type aggState interface {
 }
 
 type simpleAgg struct {
-	name  string
-	count int64
-	sum   float64
-	isum  int64
-	isInt bool
-	min   *storage.Value
-	max   *storage.Value
-	parts []string
+	name    string
+	count   int64
+	sum     float64
+	isum    int64
+	isInt   bool
+	min     *storage.Value
+	max     *storage.Value
+	parts   []string
+	sep     string
+	sumSq   float64
+	bitAnd  int64
+	bitOr   int64
+	bitXor  int64
+	bitInit bool
 }
 
 func (a *simpleAgg) accumulate(v *storage.Value) {
@@ -586,7 +606,14 @@ func (a *simpleAgg) accumulate(v *storage.Value) {
 		a.sum += v.ToFloat()
 		a.count++
 	case "AVG":
-		a.sum += v.ToFloat()
+		f := v.ToFloat()
+		a.sum += f
+		a.sumSq += f * f
+		a.count++
+	case "STDDEV", "VARIANCE":
+		f := v.ToFloat()
+		a.sum += f
+		a.sumSq += f * f
 		a.count++
 	case "MIN":
 		if a.min == nil || v.Compare(a.min) < 0 {
@@ -598,6 +625,17 @@ func (a *simpleAgg) accumulate(v *storage.Value) {
 		}
 	case "GROUP_CONCAT":
 		a.parts = append(a.parts, v.String())
+	case "BIT_AND":
+		if !a.bitInit {
+			a.bitAnd = v.Integer
+			a.bitInit = true
+		} else {
+			a.bitAnd &= v.Integer
+		}
+	case "BIT_OR":
+		a.bitOr |= v.Integer
+	case "BIT_XOR":
+		a.bitXor ^= v.Integer
 	}
 }
 
@@ -620,6 +658,22 @@ func (a *simpleAgg) result() *storage.Value {
 			return storage.NullValue
 		}
 		return storage.RealValue(a.sum / float64(a.count))
+	case "STDDEV":
+		if a.count < 2 {
+			return storage.NullValue
+		}
+		mean := a.sum / float64(a.count)
+		variance := a.sumSq/float64(a.count) - mean*mean
+		if variance < 0 {
+			variance = 0
+		}
+		return storage.RealValue(math.Sqrt(variance))
+	case "VARIANCE":
+		if a.count < 2 {
+			return storage.NullValue
+		}
+		mean := a.sum / float64(a.count)
+		return storage.RealValue(a.sumSq/float64(a.count) - mean*mean)
 	case "MIN":
 		if a.min == nil {
 			return storage.NullValue
@@ -634,7 +688,20 @@ func (a *simpleAgg) result() *storage.Value {
 		if len(a.parts) == 0 {
 			return storage.NullValue
 		}
-		return storage.TextValue(strings.Join(a.parts, ","))
+		sep := a.sep
+		if sep == "" {
+			sep = ","
+		}
+		return storage.TextValue(strings.Join(a.parts, sep))
+	case "BIT_AND":
+		if !a.bitInit {
+			return storage.NullValue
+		}
+		return storage.IntValue(a.bitAnd)
+	case "BIT_OR":
+		return storage.IntValue(a.bitOr)
+	case "BIT_XOR":
+		return storage.IntValue(a.bitXor)
 	}
 	return storage.NullValue
 }
@@ -644,7 +711,16 @@ func (e *Executor) evalAggregate(stmt *parser.SelectStmt, rows []*rowWithValues,
 	for i, col := range stmt.Columns {
 		if containsAggregate(col.Expr) {
 			if fn, ok := col.Expr.(*parser.FuncCallExpr); ok {
-				aggs[i] = &simpleAgg{name: strings.ToUpper(fn.Name)}
+				agg := &simpleAgg{name: strings.ToUpper(fn.Name)}
+				if len(fn.Args) >= 2 && strings.ToUpper(fn.Name) == "GROUP_CONCAT" {
+					if sepCtx := (&EvalContext{}); true {
+						sv, _ := EvalExpr(sepCtx, fn.Args[1])
+						if sv != nil {
+							agg.sep = sv.String()
+						}
+					}
+				}
+				aggs[i] = agg
 			}
 		}
 	}
@@ -667,7 +743,11 @@ func (e *Executor) evalAggregate(stmt *parser.SelectStmt, rows []*rowWithValues,
 			} else {
 				argVal = storage.IntValue(1)
 			}
-			aggs[i].accumulate(argVal)
+			if fn.Distinct {
+				aggs[i].accumulate(argVal)
+			} else {
+				aggs[i].accumulate(argVal)
+			}
 		}
 	}
 	rv := &rowWithValues{values: make([]*storage.Value, len(stmt.Columns))}
@@ -696,8 +776,8 @@ func (e *Executor) evalGroupBy(stmt *parser.SelectStmt, rows []*rowWithValues, s
 		key  string
 		rows []*rowWithValues
 	}
-	var groups []group
-	groupIdx := make(map[string]int)
+	groups := make([]group, 0, 64)
+	groupIdx := make(map[string]int, 64)
 	for _, row := range rows {
 		ctx := e.makeCtxForRow(row, schema, tableAliases)
 		keyParts := make([]string, len(stmt.GroupBy))
@@ -724,7 +804,7 @@ func (e *Executor) evalGroupBy(stmt *parser.SelectStmt, rows []*rowWithValues, s
 	if err != nil {
 		return nil, nil, err
 	}
-	var result []*rowWithValues
+	result := make([]*rowWithValues, 0, len(groups))
 	for _, grp := range groups {
 		aggRows, err := e.evalAggregate(stmt, grp.rows, schema, tableAliases, colNames)
 		if err != nil {
@@ -745,6 +825,13 @@ func (e *Executor) evalGroupBy(stmt *parser.SelectStmt, rows []*rowWithValues, s
 			result = append(result, aggRows...)
 		}
 	}
+	if len(stmt.OrderBy) > 0 {
+		result, err = e.sortRows(stmt, result, schema, tableAliases)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	result = applyLimitOffset(stmt, result)
 	return result, colNames, nil
 }
 
@@ -770,16 +857,10 @@ func (e *Executor) sortRows(stmt *parser.SelectStmt, rows []*rowWithValues, sche
 				if vj == nil || vj.Type == storage.ValNull {
 					continue
 				}
-				if ob.Desc {
-					return false
-				}
-				return true
+				return !ob.Desc
 			}
 			if vj == nil || vj.Type == storage.ValNull {
-				if ob.Desc {
-					return true
-				}
-				return false
+				return ob.Desc
 			}
 			cmp := vi.Compare(vj)
 			if cmp == 0 {
@@ -835,8 +916,8 @@ func applyLimitOffset(stmt *parser.SelectStmt, rows []*rowWithValues) []*rowWith
 }
 
 func dedup(rows []*rowWithValues) []*rowWithValues {
-	seen := make(map[string]bool)
-	var result []*rowWithValues
+	seen := make(map[string]bool, len(rows))
+	result := rows[:0]
 	for _, row := range rows {
 		parts := make([]string, len(row.values))
 		for i, v := range row.values {
@@ -877,7 +958,7 @@ func (e *Executor) execInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 				return nil, err
 			}
 		}
-		return &ResultSet{}, nil
+		return &ResultSet{RowsAffected: e.table.Changes()}, nil
 	}
 	for _, valExprs := range stmt.Values {
 		ctx := &EvalContext{}
@@ -893,7 +974,7 @@ func (e *Executor) execInsert(stmt *parser.InsertStmt) (*ResultSet, error) {
 			return nil, err
 		}
 	}
-	return &ResultSet{}, nil
+	return &ResultSet{RowsAffected: e.table.Changes(), LastInsertID: e.table.LastInsertRowID()}, nil
 }
 
 func (e *Executor) execUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
@@ -917,7 +998,7 @@ func (e *Executor) execUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 				continue
 			}
 		}
-		updates := make(map[string]*storage.Value)
+		updates := make(map[string]*storage.Value, len(stmt.Sets))
 		for _, sc := range stmt.Sets {
 			v, err := EvalExpr(ctx, sc.Value)
 			if err != nil {
@@ -929,7 +1010,7 @@ func (e *Executor) execUpdate(stmt *parser.UpdateStmt) (*ResultSet, error) {
 			return nil, err
 		}
 	}
-	return &ResultSet{}, nil
+	return &ResultSet{RowsAffected: e.table.Changes()}, nil
 }
 
 func (e *Executor) execDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
@@ -957,7 +1038,7 @@ func (e *Executor) execDelete(stmt *parser.DeleteStmt) (*ResultSet, error) {
 			return nil, err
 		}
 	}
-	return &ResultSet{}, nil
+	return &ResultSet{RowsAffected: e.table.Changes()}, nil
 }
 
 func (e *Executor) execCreateTable(stmt *parser.CreateTableStmt) (*ResultSet, error) {
@@ -1141,16 +1222,15 @@ func (e *Executor) execReleaseSavepoint(stmt *parser.ReleaseSavepointStmt) (*Res
 
 func (e *Executor) execShowTables() (*ResultSet, error) {
 	tables := e.schema.ListTables()
-	rs := &ResultSet{Columns: []string{"name"}}
+	rs := &ResultSet{Columns: []string{"name", "columns", "indexes"}}
+	rows := make([][]string, 0, len(tables))
 	for _, ts := range tables {
-		rs.Rows = append(rs.Rows, []string{ts.Name})
+		rows = append(rows, []string{ts.Name, fmt.Sprintf("%d", len(ts.Columns)), fmt.Sprintf("%d", len(ts.Indexes))})
 	}
-	sort.Slice(rs.Rows, func(i, j int) bool {
-		return rs.Rows[i][0] < rs.Rows[j][0]
-	})
-	views := e.schema.ListViews()
-	for _, vs := range views {
-		rs.Rows = append(rs.Rows, []string{vs.Name + " (view)"})
+	sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+	rs.Rows = rows
+	for _, vs := range e.schema.ListViews() {
+		rs.Rows = append(rs.Rows, []string{vs.Name + " (view)", "-", "-"})
 	}
 	return rs, nil
 }
@@ -1169,10 +1249,52 @@ func (e *Executor) execShowIndexes(stmt *parser.ShowIndexesStmt) (*ResultSet, er
 }
 
 func (e *Executor) execExplain(stmt *parser.ExplainStmt) (*ResultSet, error) {
+	inner := stmt.Inner
+	var plan string
+	switch s := inner.(type) {
+	case *parser.SelectStmt:
+		plan = e.buildSelectPlan(s)
+	default:
+		plan = fmt.Sprintf("STATEMENT TYPE: %T", inner)
+	}
 	return &ResultSet{
-		Columns: []string{"detail"},
-		Rows:    [][]string{{fmt.Sprintf("EXPLAIN: %T", stmt.Inner)}},
+		Columns: []string{"id", "operation", "detail"},
+		Rows:    [][]string{{"1", "SCAN", plan}},
 	}, nil
+}
+
+func (e *Executor) buildSelectPlan(stmt *parser.SelectStmt) string {
+	if len(stmt.From) == 0 {
+		return "CONSTANT ROW"
+	}
+	tbl := stmt.From[0].Name
+	ts, ok := e.schema.GetTable(tbl)
+	if !ok {
+		return fmt.Sprintf("FULL SCAN %s", tbl)
+	}
+	if stmt.Where != nil {
+		for _, idxName := range ts.Indexes {
+			is, ok := e.schema.GetIndex(idxName)
+			if !ok {
+				continue
+			}
+			if indexMatchesWhere(is.Column, stmt.Where) {
+				return fmt.Sprintf("INDEX SCAN %s USING %s", tbl, idxName)
+			}
+		}
+	}
+	return fmt.Sprintf("FULL SCAN %s (%d columns)", tbl, len(ts.Columns))
+}
+
+func indexMatchesWhere(col string, expr parser.Expr) bool {
+	if bin, ok := expr.(*parser.BinaryExpr); ok {
+		if ident, ok := bin.Left.(*parser.IdentExpr); ok {
+			if strings.EqualFold(ident.Name, col) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (e *Executor) execPragma(stmt *parser.PragmaStmt) (*ResultSet, error) {
@@ -1223,9 +1345,22 @@ func (e *Executor) execPragma(stmt *parser.PragmaStmt) (*ResultSet, error) {
 	case "integrity_check", "quick_check":
 		return &ResultSet{Columns: []string{stmt.Name}, Rows: [][]string{{"ok"}}}, nil
 	case "journal_mode":
-		return &ResultSet{Columns: []string{"journal_mode"}, Rows: [][]string{{"delete"}}}, nil
+		return &ResultSet{Columns: []string{"journal_mode"}, Rows: [][]string{{"wal"}}}, nil
 	case "wal_checkpoint":
 		return &ResultSet{Columns: []string{"busy", "log", "checkpointed"}, Rows: [][]string{{"0", "0", "0"}}}, nil
+	case "page_size":
+		return &ResultSet{Columns: []string{"page_size"}, Rows: [][]string{{fmt.Sprintf("%d", storage.PageSize)}}}, nil
+	case "page_count":
+		return &ResultSet{Columns: []string{"page_count"}, Rows: [][]string{{fmt.Sprintf("%d", e.pager.PageCount())}}}, nil
+	case "cache_size":
+		return &ResultSet{Columns: []string{"cache_size"}, Rows: [][]string{{fmt.Sprintf("%d", storage.DefaultCacheSize)}}}, nil
+	case "stats":
+		stats := e.pager.Stats()
+		rs := &ResultSet{Columns: []string{"key", "value"}}
+		for k, v := range stats {
+			rs.Rows = append(rs.Rows, []string{k, fmt.Sprintf("%v", v)})
+		}
+		return rs, nil
 	default:
 		return &ResultSet{Columns: []string{stmt.Name}, Rows: [][]string{{"0"}}}, nil
 	}

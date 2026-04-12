@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
-	"github.com/tyowk/sqlgo/parser"
-	"github.com/tyowk/sqlgo/storage"
+	"github.com/tyowk/sqlgo/internal/engine/parser"
+	"github.com/tyowk/sqlgo/internal/storage"
 )
 
 type EvalContext struct {
@@ -24,6 +26,20 @@ type tableBinding struct {
 	Schema *storage.TableSchema
 	Row    *storage.Row
 	RowID  int64
+}
+
+var regexpCache sync.Map
+
+func cachedRegexp(pattern string) (*regexp.Regexp, error) {
+	if v, ok := regexpCache.Load(pattern); ok {
+		return v.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	regexpCache.Store(pattern, re)
+	return re, nil
 }
 
 func NewEvalContext(row *storage.Row, schema *storage.TableSchema) *EvalContext {
@@ -312,6 +328,15 @@ func evalBinary(ctx *EvalContext, e *parser.BinaryExpr) (*storage.Value, error) 
 			return storage.IntValue(1), nil
 		}
 		return storage.IntValue(0), nil
+	case "REGEXP":
+		re, err := cachedRegexp(right.String())
+		if err != nil {
+			return storage.IntValue(0), nil
+		}
+		if re.MatchString(left.String()) {
+			return storage.IntValue(1), nil
+		}
+		return storage.IntValue(0), nil
 	}
 	return storage.NullValue, fmt.Errorf("unknown operator: %s", e.Op)
 }
@@ -437,7 +462,7 @@ func evalGlob(ctx *EvalContext, e *parser.GlobExpr) (*storage.Value, error) {
 	if val.Type == storage.ValNull || pat.Type == storage.ValNull {
 		return storage.NullValue, nil
 	}
-	matched := globMatch(val.String(), pat.String())
+	matched := globMatchRunes([]rune(val.String()), []rune(pat.String()))
 	if e.IsNot {
 		matched = !matched
 	}
@@ -445,12 +470,6 @@ func evalGlob(ctx *EvalContext, e *parser.GlobExpr) (*storage.Value, error) {
 		return storage.IntValue(1), nil
 	}
 	return storage.IntValue(0), nil
-}
-
-func globMatch(str, pattern string) bool {
-	srunes := []rune(str)
-	prunes := []rune(pattern)
-	return globMatchRunes(srunes, prunes)
 }
 
 func globMatchRunes(str, pattern []rune) bool {
@@ -580,15 +599,18 @@ func evalCast(ctx *EvalContext, e *parser.CastExpr) (*storage.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	colType := storage.NormalizeType(e.Type)
-	return storage.CoerceValue(val, colType)
+	return storage.CoerceValue(val, storage.NormalizeType(e.Type))
+}
+
+func requireArg(e *parser.FuncCallExpr, n int) bool {
+	return len(e.Args) >= n
 }
 
 func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) {
 	fn := strings.ToUpper(e.Name)
 	switch fn {
 	case "UPPER":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -601,7 +623,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.ToUpper(v.String())), nil
 
 	case "LOWER":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -614,7 +636,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.ToLower(v.String())), nil
 
 	case "LENGTH":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -630,7 +652,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(utf8.RuneCountInString(v.String()))), nil
 
 	case "ABS":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -663,7 +685,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.NullValue, nil
 
 	case "IFNULL", "NVL":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -676,7 +698,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return EvalExpr(ctx, e.Args[1])
 
 	case "NULLIF":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		v1, err := EvalExpr(ctx, e.Args[0])
@@ -693,7 +715,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return v1, nil
 
 	case "IIF":
-		if len(e.Args) < 3 {
+		if !requireArg(e, 3) {
 			return storage.NullValue, nil
 		}
 		cond, err := EvalExpr(ctx, e.Args[0])
@@ -706,7 +728,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return EvalExpr(ctx, e.Args[2])
 
 	case "SUBSTR", "SUBSTRING":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		str, err := EvalExpr(ctx, e.Args[0])
@@ -748,7 +770,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(string(s[st:])), nil
 
 	case "TRIM":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -765,7 +787,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.TrimSpace(v.String())), nil
 
 	case "LTRIM":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -782,7 +804,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.TrimLeft(v.String(), " \t\n\r")), nil
 
 	case "RTRIM":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -799,7 +821,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.TrimRight(v.String(), " \t\n\r")), nil
 
 	case "REPLACE":
-		if len(e.Args) < 3 {
+		if !requireArg(e, 3) {
 			return storage.NullValue, nil
 		}
 		str, _ := EvalExpr(ctx, e.Args[0])
@@ -811,7 +833,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(strings.ReplaceAll(str.String(), old.String(), newStr.String())), nil
 
 	case "ROUND":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -830,7 +852,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.RealValue(math.Round(v.ToFloat()*factor) / factor), nil
 
 	case "FLOOR":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -840,7 +862,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.RealValue(math.Floor(v.ToFloat())), nil
 
 	case "CEIL", "CEILING":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -850,7 +872,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.RealValue(math.Ceil(v.ToFloat())), nil
 
 	case "TYPEOF":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, err := EvalExpr(ctx, e.Args[0])
@@ -871,29 +893,25 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		}
 
 	case "HEX":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		if v.Type == storage.ValNull {
 			return storage.NullValue, nil
 		}
-		if v.Type == storage.ValBlob {
-			var sb strings.Builder
-			for _, b := range v.Blob {
-				sb.WriteString(fmt.Sprintf("%02X", b))
-			}
-			return storage.TextValue(sb.String()), nil
-		}
-		b := []byte(v.String())
 		var sb strings.Builder
-		for _, by := range b {
-			sb.WriteString(fmt.Sprintf("%02X", by))
+		data := []byte(v.String())
+		if v.Type == storage.ValBlob {
+			data = v.Blob
+		}
+		for _, b := range data {
+			fmt.Fprintf(&sb, "%02X", b)
 		}
 		return storage.TextValue(sb.String()), nil
 
 	case "UNHEX":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -923,7 +941,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(sb.String()), nil
 
 	case "UNICODE":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -934,7 +952,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(r)), nil
 
 	case "INSTR":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		haystack, _ := EvalExpr(ctx, e.Args[0])
@@ -949,7 +967,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(utf8.RuneCountInString(haystack.String()[:idx]) + 1)), nil
 
 	case "QUOTE":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -957,27 +975,25 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 			return storage.TextValue("NULL"), nil
 		}
 		if v.Type == storage.ValText {
-			escaped := strings.ReplaceAll(v.Text, "'", "''")
-			return storage.TextValue("'" + escaped + "'"), nil
+			return storage.TextValue("'" + strings.ReplaceAll(v.Text, "'", "''") + "'"), nil
 		}
 		return storage.TextValue(v.String()), nil
 
 	case "PRINTF", "FORMAT":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		fmtv, _ := EvalExpr(ctx, e.Args[0])
 		if fmtv.Type == storage.ValNull {
 			return storage.NullValue, nil
 		}
-		result := sqlPrintf(fmtv.String(), e.Args[1:], ctx)
-		return storage.TextValue(result), nil
+		return storage.TextValue(sqlPrintf(fmtv.String(), e.Args[1:], ctx)), nil
 
 	case "RANDOM":
 		return storage.IntValue(rand.Int63()), nil
 
 	case "RANDOMBLOB":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		n, _ := EvalExpr(ctx, e.Args[0])
@@ -992,50 +1008,68 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.BlobValue(buf), nil
 
 	case "ZEROBLOB":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		n, _ := EvalExpr(ctx, e.Args[0])
 		return storage.BlobValue(make([]byte, int(n.Integer))), nil
 
 	case "DATE":
-		return storage.TextValue(time.Now().Format("2006-01-02")), nil
-
-	case "TIME":
-		return storage.TextValue(time.Now().Format("15:04:05")), nil
-
-	case "DATETIME":
 		if len(e.Args) == 0 {
-			return storage.TextValue(time.Now().Format("2006-01-02 15:04:05")), nil
+			return storage.TextValue(time.Now().UTC().Format("2006-01-02")), nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		if strings.ToLower(v.String()) == "now" {
-			return storage.TextValue(time.Now().Format("2006-01-02 15:04:05")), nil
+			return storage.TextValue(time.Now().UTC().Format("2006-01-02")), nil
+		}
+		return storage.TextValue(v.String()[:10]), nil
+
+	case "TIME":
+		if len(e.Args) == 0 {
+			return storage.TextValue(time.Now().UTC().Format("15:04:05")), nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if strings.ToLower(v.String()) == "now" {
+			return storage.TextValue(time.Now().UTC().Format("15:04:05")), nil
+		}
+		s := v.String()
+		if len(s) >= 19 {
+			return storage.TextValue(s[11:19]), nil
+		}
+		return storage.TextValue(s), nil
+
+	case "DATETIME":
+		if len(e.Args) == 0 {
+			return storage.TextValue(time.Now().UTC().Format("2006-01-02 15:04:05")), nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if strings.ToLower(v.String()) == "now" {
+			return storage.TextValue(time.Now().UTC().Format("2006-01-02 15:04:05")), nil
 		}
 		return storage.TextValue(v.String()), nil
 
 	case "JULIANDAY":
-		now := time.Now()
+		now := time.Now().UTC()
 		j := 2440587.5 + float64(now.Unix())/86400.0
 		return storage.RealValue(j), nil
 
-	case "UNIXEPOCH", "STRFTIME":
-		if fn == "UNIXEPOCH" {
-			return storage.IntValue(time.Now().Unix()), nil
-		}
-		if len(e.Args) < 2 {
-			return storage.TextValue(time.Now().Format("2006-01-02 15:04:05")), nil
+	case "UNIXEPOCH":
+		return storage.IntValue(time.Now().UTC().Unix()), nil
+
+	case "STRFTIME":
+		if !requireArg(e, 2) {
+			return storage.TextValue(time.Now().UTC().Format("2006-01-02 15:04:05")), nil
 		}
 		fmtArg, _ := EvalExpr(ctx, e.Args[0])
 		timeArg, _ := EvalExpr(ctx, e.Args[1])
 		layout := sqliteStrftimeToGo(fmtArg.String())
 		if strings.ToLower(timeArg.String()) == "now" {
-			return storage.TextValue(time.Now().Format(layout)), nil
+			return storage.TextValue(time.Now().UTC().Format(layout)), nil
 		}
 		return storage.TextValue(timeArg.String()), nil
 
 	case "SQLITE_VERSION", "SQLGO_VERSION":
-		return storage.TextValue("sqlgo-2.0"), nil
+		return storage.TextValue("sqlgo-3.0"), nil
 
 	case "LAST_INSERT_ROWID":
 		return storage.IntValue(0), nil
@@ -1078,20 +1112,11 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		}
 		return result, nil
 
-	case "COUNT":
+	case "COUNT", "SUM", "TOTAL", "AVG", "GROUP_CONCAT":
 		return storage.IntValue(0), nil
-
-	case "SUM", "TOTAL":
-		return storage.IntValue(0), nil
-
-	case "AVG":
-		return storage.NullValue, nil
-
-	case "GROUP_CONCAT":
-		return storage.NullValue, nil
 
 	case "SIGN":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1107,7 +1132,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(0), nil
 
 	case "POW", "POWER":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		base, _ := EvalExpr(ctx, e.Args[0])
@@ -1115,88 +1140,151 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.RealValue(math.Pow(base.ToFloat(), exp.ToFloat())), nil
 
 	case "SQRT":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		return storage.RealValue(math.Sqrt(v.ToFloat())), nil
 
-	case "LOG", "LOG2", "LOG10":
-		if len(e.Args) < 1 {
+	case "LOG", "LN":
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
-		switch fn {
-		case "LOG2":
-			return storage.RealValue(math.Log2(v.ToFloat())), nil
-		case "LOG10":
-			return storage.RealValue(math.Log10(v.ToFloat())), nil
-		default:
-			if len(e.Args) >= 2 {
-				base, _ := EvalExpr(ctx, e.Args[0])
-				val, _ := EvalExpr(ctx, e.Args[1])
-				return storage.RealValue(math.Log(val.ToFloat()) / math.Log(base.ToFloat())), nil
-			}
-			return storage.RealValue(math.Log(v.ToFloat())), nil
+		if len(e.Args) >= 2 {
+			base, _ := EvalExpr(ctx, e.Args[0])
+			val, _ := EvalExpr(ctx, e.Args[1])
+			return storage.RealValue(math.Log(val.ToFloat()) / math.Log(base.ToFloat())), nil
 		}
+		return storage.RealValue(math.Log(v.ToFloat())), nil
+
+	case "LOG2":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Log2(v.ToFloat())), nil
+
+	case "LOG10":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Log10(v.ToFloat())), nil
 
 	case "EXP":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		return storage.RealValue(math.Exp(v.ToFloat())), nil
 
-	case "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2":
-		if len(e.Args) < 1 {
+	case "SIN":
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
-		switch fn {
-		case "SIN":
-			return storage.RealValue(math.Sin(v.ToFloat())), nil
-		case "COS":
-			return storage.RealValue(math.Cos(v.ToFloat())), nil
-		case "TAN":
-			return storage.RealValue(math.Tan(v.ToFloat())), nil
-		case "ASIN":
-			return storage.RealValue(math.Asin(v.ToFloat())), nil
-		case "ACOS":
-			return storage.RealValue(math.Acos(v.ToFloat())), nil
-		case "ATAN":
-			return storage.RealValue(math.Atan(v.ToFloat())), nil
-		case "ATAN2":
-			if len(e.Args) >= 2 {
-				v2, _ := EvalExpr(ctx, e.Args[1])
-				return storage.RealValue(math.Atan2(v.ToFloat(), v2.ToFloat())), nil
-			}
-			return storage.RealValue(math.Atan(v.ToFloat())), nil
+		return storage.RealValue(math.Sin(v.ToFloat())), nil
+
+	case "COS":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
 		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Cos(v.ToFloat())), nil
+
+	case "TAN":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Tan(v.ToFloat())), nil
+
+	case "ASIN":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Asin(v.ToFloat())), nil
+
+	case "ACOS":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Acos(v.ToFloat())), nil
+
+	case "ATAN":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Atan(v.ToFloat())), nil
+
+	case "ATAN2":
+		if !requireArg(e, 2) {
+			return storage.NullValue, nil
+		}
+		y, _ := EvalExpr(ctx, e.Args[0])
+		x, _ := EvalExpr(ctx, e.Args[1])
+		return storage.RealValue(math.Atan2(y.ToFloat(), x.ToFloat())), nil
+
+	case "SINH":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Sinh(v.ToFloat())), nil
+
+	case "COSH":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Cosh(v.ToFloat())), nil
+
+	case "TANH":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(math.Tanh(v.ToFloat())), nil
 
 	case "PI":
 		return storage.RealValue(math.Pi), nil
 
 	case "DEGREES":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		return storage.RealValue(v.ToFloat() * 180 / math.Pi), nil
 
 	case "RADIANS":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
 		return storage.RealValue(v.ToFloat() * math.Pi / 180), nil
 
+	case "MOD":
+		if !requireArg(e, 2) {
+			return storage.NullValue, nil
+		}
+		a, _ := EvalExpr(ctx, e.Args[0])
+		b, _ := EvalExpr(ctx, e.Args[1])
+		if b.ToFloat() == 0 {
+			return storage.NullValue, nil
+		}
+		return storage.RealValue(math.Mod(a.ToFloat(), b.ToFloat())), nil
+
 	case "CONCAT", "CONCAT_WS":
 		if fn == "CONCAT_WS" {
-			if len(e.Args) < 1 {
+			if !requireArg(e, 1) {
 				return storage.NullValue, nil
 			}
 			sep, _ := EvalExpr(ctx, e.Args[0])
-			parts := []string{}
+			var parts []string
 			for _, arg := range e.Args[1:] {
 				v, _ := EvalExpr(ctx, arg)
 				if v.Type != storage.ValNull {
@@ -1216,7 +1304,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(sb.String()), nil
 
 	case "LPAD":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		str, _ := EvalExpr(ctx, e.Args[0])
@@ -1226,15 +1314,22 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 			pc, _ := EvalExpr(ctx, e.Args[2])
 			padChar = pc.String()
 		}
+		if padChar == "" {
+			padChar = " "
+		}
 		s := str.String()
 		n := int(lenVal.Integer)
-		for len(s) < n {
+		for utf8.RuneCountInString(s) < n {
 			s = padChar + s
 		}
-		return storage.TextValue(s[:n]), nil
+		runes := []rune(s)
+		if len(runes) > n {
+			runes = runes[len(runes)-n:]
+		}
+		return storage.TextValue(string(runes)), nil
 
 	case "RPAD":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		str, _ := EvalExpr(ctx, e.Args[0])
@@ -1244,23 +1339,34 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 			pc, _ := EvalExpr(ctx, e.Args[2])
 			padChar = pc.String()
 		}
+		if padChar == "" {
+			padChar = " "
+		}
 		s := str.String()
 		n := int(lenVal.Integer)
-		for len(s) < n {
+		for utf8.RuneCountInString(s) < n {
 			s = s + padChar
 		}
-		return storage.TextValue(s[:n]), nil
+		runes := []rune(s)
+		if len(runes) > n {
+			runes = runes[:n]
+		}
+		return storage.TextValue(string(runes)), nil
 
 	case "REPEAT":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		str, _ := EvalExpr(ctx, e.Args[0])
 		times, _ := EvalExpr(ctx, e.Args[1])
-		return storage.TextValue(strings.Repeat(str.String(), int(times.Integer))), nil
+		n := int(times.Integer)
+		if n <= 0 {
+			return storage.TextValue(""), nil
+		}
+		return storage.TextValue(strings.Repeat(str.String(), n)), nil
 
 	case "REVERSE":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		str, _ := EvalExpr(ctx, e.Args[0])
@@ -1271,14 +1377,14 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.TextValue(string(runes)), nil
 
 	case "SPACE":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		n, _ := EvalExpr(ctx, e.Args[0])
 		return storage.TextValue(strings.Repeat(" ", int(n.Integer))), nil
 
 	case "CHAR_LENGTH", "CHARACTER_LENGTH":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1288,7 +1394,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(utf8.RuneCountInString(v.String()))), nil
 
 	case "OCTET_LENGTH":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1301,7 +1407,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(len(v.String()))), nil
 
 	case "POSITION":
-		if len(e.Args) < 2 {
+		if !requireArg(e, 2) {
 			return storage.NullValue, nil
 		}
 		needle, _ := EvalExpr(ctx, e.Args[0])
@@ -1313,7 +1419,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(int64(idx + 1)), nil
 
 	case "ISNULL":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1323,7 +1429,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(0), nil
 
 	case "NOTNULL", "IFNOTNULL":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1333,7 +1439,7 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 		return storage.IntValue(0), nil
 
 	case "NOT":
-		if len(e.Args) < 1 {
+		if !requireArg(e, 1) {
 			return storage.NullValue, nil
 		}
 		v, _ := EvalExpr(ctx, e.Args[0])
@@ -1341,6 +1447,213 @@ func evalFunc(ctx *EvalContext, e *parser.FuncCallExpr) (*storage.Value, error) 
 			return storage.IntValue(0), nil
 		}
 		return storage.IntValue(1), nil
+
+	case "REGEXP_LIKE", "REGEXP_MATCHES":
+		if !requireArg(e, 2) {
+			return storage.NullValue, nil
+		}
+		str, _ := EvalExpr(ctx, e.Args[0])
+		pat, _ := EvalExpr(ctx, e.Args[1])
+		re, err := cachedRegexp(pat.String())
+		if err != nil {
+			return storage.IntValue(0), nil
+		}
+		if re.MatchString(str.String()) {
+			return storage.IntValue(1), nil
+		}
+		return storage.IntValue(0), nil
+
+	case "REGEXP_REPLACE":
+		if !requireArg(e, 3) {
+			return storage.NullValue, nil
+		}
+		str, _ := EvalExpr(ctx, e.Args[0])
+		pat, _ := EvalExpr(ctx, e.Args[1])
+		repl, _ := EvalExpr(ctx, e.Args[2])
+		re, err := cachedRegexp(pat.String())
+		if err != nil {
+			return str, nil
+		}
+		return storage.TextValue(re.ReplaceAllString(str.String(), repl.String())), nil
+
+	case "REGEXP_SUBSTR":
+		if !requireArg(e, 2) {
+			return storage.NullValue, nil
+		}
+		str, _ := EvalExpr(ctx, e.Args[0])
+		pat, _ := EvalExpr(ctx, e.Args[1])
+		re, err := cachedRegexp(pat.String())
+		if err != nil {
+			return storage.NullValue, nil
+		}
+		match := re.FindString(str.String())
+		if match == "" {
+			return storage.NullValue, nil
+		}
+		return storage.TextValue(match), nil
+
+	case "UUID", "GEN_RANDOM_UUID":
+		b := make([]byte, 16)
+		for i := range b {
+			b[i] = byte(rand.Intn(256))
+		}
+		b[6] = (b[6] & 0x0f) | 0x40
+		b[8] = (b[8] & 0x3f) | 0x80
+		return storage.TextValue(fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])), nil
+
+	case "CURRENT_TIMESTAMP", "NOW":
+		return storage.TextValue(time.Now().UTC().Format("2006-01-02 15:04:05")), nil
+
+	case "CURRENT_DATE":
+		return storage.TextValue(time.Now().UTC().Format("2006-01-02")), nil
+
+	case "CURRENT_TIME":
+		return storage.TextValue(time.Now().UTC().Format("15:04:05")), nil
+
+	case "TO_CHAR":
+		if !requireArg(e, 2) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		fmtStr, _ := EvalExpr(ctx, e.Args[1])
+		switch v.Type {
+		case storage.ValInteger:
+			return storage.TextValue(fmt.Sprintf(fmtStr.String(), v.Integer)), nil
+		case storage.ValReal:
+			return storage.TextValue(fmt.Sprintf(fmtStr.String(), v.Real)), nil
+		}
+		return storage.TextValue(v.String()), nil
+
+	case "GREATEST":
+		if len(e.Args) == 0 {
+			return storage.NullValue, nil
+		}
+		result, _ := EvalExpr(ctx, e.Args[0])
+		for _, arg := range e.Args[1:] {
+			v, _ := EvalExpr(ctx, arg)
+			if v.Type != storage.ValNull && (result.Type == storage.ValNull || v.Compare(result) > 0) {
+				result = v
+			}
+		}
+		return result, nil
+
+	case "LEAST":
+		if len(e.Args) == 0 {
+			return storage.NullValue, nil
+		}
+		result, _ := EvalExpr(ctx, e.Args[0])
+		for _, arg := range e.Args[1:] {
+			v, _ := EvalExpr(ctx, arg)
+			if v.Type != storage.ValNull && (result.Type == storage.ValNull || v.Compare(result) < 0) {
+				result = v
+			}
+		}
+		return result, nil
+
+	case "TRUNCATE", "TRUNC":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if v.Type == storage.ValNull {
+			return storage.NullValue, nil
+		}
+		precision := int64(0)
+		if len(e.Args) >= 2 {
+			p, _ := EvalExpr(ctx, e.Args[1])
+			precision = p.Integer
+		}
+		factor := math.Pow(10, float64(precision))
+		return storage.RealValue(math.Trunc(v.ToFloat()*factor) / factor), nil
+
+	case "BIT_LENGTH":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.IntValue(int64(len(v.String()) * 8)), nil
+
+	case "INITCAP":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if v.Type == storage.ValNull {
+			return storage.NullValue, nil
+		}
+		words := strings.Fields(v.String())
+		for i, w := range words {
+			if len(w) > 0 {
+				words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+			}
+		}
+		return storage.TextValue(strings.Join(words, " ")), nil
+
+	case "SPLIT_PART":
+		if !requireArg(e, 3) {
+			return storage.NullValue, nil
+		}
+		str, _ := EvalExpr(ctx, e.Args[0])
+		delim, _ := EvalExpr(ctx, e.Args[1])
+		n, _ := EvalExpr(ctx, e.Args[2])
+		parts := strings.Split(str.String(), delim.String())
+		idx := int(n.Integer) - 1
+		if idx < 0 || idx >= len(parts) {
+			return storage.TextValue(""), nil
+		}
+		return storage.TextValue(parts[idx]), nil
+
+	case "ARRAY_LENGTH", "CARDINALITY":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		parts := strings.Split(v.String(), ",")
+		return storage.IntValue(int64(len(parts))), nil
+
+	case "BOOL", "BOOLEAN":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if IsTruthy(v) {
+			return storage.IntValue(1), nil
+		}
+		return storage.IntValue(0), nil
+
+	case "INT", "INTEGER":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.IntValue(int64(v.ToFloat())), nil
+
+	case "FLOAT", "REAL", "DOUBLE":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		return storage.RealValue(v.ToFloat()), nil
+
+	case "STRING", "TEXT", "STR":
+		if !requireArg(e, 1) {
+			return storage.NullValue, nil
+		}
+		v, _ := EvalExpr(ctx, e.Args[0])
+		if v.Type == storage.ValNull {
+			return storage.NullValue, nil
+		}
+		return storage.TextValue(v.String()), nil
+
+	case "STDDEV", "STDDEV_POP", "STDDEV_SAMP":
+		return storage.NullValue, nil
+
+	case "VARIANCE", "VAR_POP", "VAR_SAMP":
+		return storage.NullValue, nil
+
+	case "BIT_AND", "BIT_OR", "BIT_XOR":
+		return storage.NullValue, nil
 	}
 	return storage.NullValue, fmt.Errorf("unknown function: %s", e.Name)
 }
@@ -1386,14 +1699,21 @@ func sqlPrintf(format string, args []parser.Expr, ctx *EvalContext) string {
 		case 'd', 'i':
 			sb.WriteString(strconv.FormatInt(v.Integer, 10))
 		case 'f':
-			sb.WriteString(strconv.FormatFloat(v.ToFloat(), 'f', -1, 64))
+			sb.WriteString(strconv.FormatFloat(v.ToFloat(), 'f', 6, 64))
+		case 'e':
+			sb.WriteString(strconv.FormatFloat(v.ToFloat(), 'e', 6, 64))
 		case 'g':
 			sb.WriteString(strconv.FormatFloat(v.ToFloat(), 'g', -1, 64))
 		case 's':
 			sb.WriteString(v.String())
 		case 'q':
-			escaped := strings.ReplaceAll(v.String(), "'", "''")
-			sb.WriteString("'" + escaped + "'")
+			sb.WriteString("'" + strings.ReplaceAll(v.String(), "'", "''") + "'")
+		case 'x':
+			sb.WriteString(strconv.FormatInt(v.Integer, 16))
+		case 'X':
+			sb.WriteString(strings.ToUpper(strconv.FormatInt(v.Integer, 16)))
+		case 'o':
+			sb.WriteString(strconv.FormatInt(v.Integer, 8))
 		default:
 			sb.WriteByte('%')
 			sb.WriteByte(format[i])

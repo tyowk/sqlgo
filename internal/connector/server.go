@@ -1,4 +1,4 @@
-package server
+package connector
 
 import (
 	"bufio"
@@ -6,40 +6,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/tyowk/sqlgo/auth"
-	"github.com/tyowk/sqlgo/executor"
-	"github.com/tyowk/sqlgo/storage"
+	"github.com/tyowk/sqlgo/internal/engine/executor"
+	"github.com/tyowk/sqlgo/internal/storage"
 )
 
 const (
-	readTimeout  = 30 * time.Second
-	writeTimeout = 10 * time.Second
-	maxConnBuf   = 4 * 1024 * 1024
-	maxIdleConns = 100
+	readTimeout   = 60 * time.Second
+	writeTimeout  = 15 * time.Second
+	maxConnBuf    = 8 * 1024 * 1024
+	maxIdleConns  = 512
+	keepAlivePing = 30 * time.Second
 )
 
 type Server struct {
 	addr       string
 	pager      *storage.Pager
 	schema     *storage.SchemaManager
-	cred       *auth.Credential
-	mu         sync.RWMutex
+	cred       *Credential
+	writeMu    sync.Mutex
 	listener   net.Listener
 	conns      sync.Map
 	connCount  int64
 	queryCount int64
 	authFails  int64
+	errorCount int64
+	bytesSent  int64
+	bytesRecv  int64
+	startTime  time.Time
 	ctx        context.Context
 	cancel     context.CancelFunc
+	workerPool chan struct{}
 }
 
 type Request struct {
-	SQL string `json:"sql"`
+	SQL      string `json:"sql"`
+	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
 type Response struct {
@@ -49,20 +56,27 @@ type Response struct {
 	RowsAffected int64      `json:"rows_affected,omitempty"`
 	LastInsertID int64      `json:"last_insert_id,omitempty"`
 	Elapsed      string     `json:"elapsed,omitempty"`
+	QueryID      int64      `json:"query_id,omitempty"`
 }
 
-func New(addr string, pager *storage.Pager, schema *storage.SchemaManager, cred *auth.Credential) *Server {
+func NewServer(addr string, pager *storage.Pager, schema *storage.SchemaManager, cred *Credential) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	if cred == nil {
-		cred = &auth.Credential{Mode: auth.ModeNone}
+		cred = &Credential{Mode: ModeNone}
+	}
+	workers := runtime.NumCPU() * 2
+	if workers < 4 {
+		workers = 4
 	}
 	return &Server{
-		addr:   addr,
-		pager:  pager,
-		schema: schema,
-		cred:   cred,
-		ctx:    ctx,
-		cancel: cancel,
+		addr:       addr,
+		pager:      pager,
+		schema:     schema,
+		cred:       cred,
+		ctx:        ctx,
+		cancel:     cancel,
+		startTime:  time.Now(),
+		workerPool: make(chan struct{}, workers),
 	}
 }
 
@@ -71,8 +85,12 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.addr, err)
 	}
+	if tcpLn, ok := ln.(*net.TCPListener); ok {
+		_ = tcpLn
+	}
 	s.listener = ln
-	fmt.Printf("sqlgo server listening on %s (auth: %s)\n", s.addr, string(s.cred.Mode))
+	fmt.Printf("sqlgo server listening on %s (auth: %s, workers: %d)\n",
+		s.addr, string(s.cred.Mode), cap(s.workerPool))
 
 	for {
 		select {
@@ -87,7 +105,8 @@ func (s *Server) Start() error {
 			case <-s.ctx.Done():
 				return nil
 			default:
-				return err
+				atomic.AddInt64(&s.errorCount, 1)
+				continue
 			}
 		}
 
@@ -98,8 +117,22 @@ func (s *Server) Start() error {
 			continue
 		}
 
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(keepAlivePing)
+		}
+
 		go s.handleConn(conn)
 	}
+}
+
+func isReadOnlySQL(sql string) bool {
+	trimmed := strings.TrimSpace(strings.ToUpper(sql))
+	return strings.HasPrefix(trimmed, "SELECT") ||
+		strings.HasPrefix(trimmed, "EXPLAIN") ||
+		strings.HasPrefix(trimmed, "SHOW") ||
+		strings.HasPrefix(trimmed, "PRAGMA")
 }
 
 func (s *Server) handleConn(conn net.Conn) {
@@ -111,9 +144,9 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	s.conns.Store(conn.RemoteAddr().String(), conn)
 
-	if err := auth.ServerHandshake(conn, s.cred); err != nil {
+	if err := ServerHandshake(conn, s.cred); err != nil {
 		atomic.AddInt64(&s.authFails, 1)
-		fmt.Printf("[auth] %v\n", err)
+		fmt.Printf("[auth] %s: %v\n", conn.RemoteAddr(), err)
 		return
 	}
 
@@ -133,6 +166,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		atomic.AddInt64(&s.bytesRecv, int64(len(line)))
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -146,17 +180,29 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		queryID := atomic.AddInt64(&s.queryCount, 1)
 		start := time.Now()
-		s.mu.Lock()
-		rs, execErr := exec.Execute(req.SQL)
-		s.mu.Unlock()
+
+		var rs *executor.ResultSet
+		var execErr error
+
+		readOnly := req.ReadOnly || isReadOnlySQL(req.SQL)
+		if readOnly {
+			rs, execErr = exec.Execute(req.SQL)
+		} else {
+			s.writeMu.Lock()
+			rs, execErr = exec.Execute(req.SQL)
+			s.writeMu.Unlock()
+		}
+
 		elapsed := time.Since(start)
-		atomic.AddInt64(&s.queryCount, 1)
 
 		var resp Response
+		resp.QueryID = queryID
 		resp.Elapsed = elapsed.String()
 		if execErr != nil {
 			resp.Error = execErr.Error()
+			atomic.AddInt64(&s.errorCount, 1)
 		} else if rs != nil {
 			resp.Columns = rs.Columns
 			resp.Rows = rs.Rows
@@ -167,6 +213,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if encErr := encoder.Encode(resp); encErr != nil {
 			return
+		}
+
+		if elapsed > 5*time.Second {
+			fmt.Printf("[slow query %dms] %s\n", elapsed.Milliseconds(), req.SQL[:min(len(req.SQL), 100)])
 		}
 	}
 }
@@ -185,10 +235,16 @@ func (s *Server) Stop() {
 	s.pager.FlushAll()
 }
 
-func (s *Server) Stats() map[string]int64 {
-	return map[string]int64{
+func (s *Server) Stats() map[string]interface{} {
+	return map[string]interface{}{
 		"connections": atomic.LoadInt64(&s.connCount),
 		"queries":     atomic.LoadInt64(&s.queryCount),
 		"auth_fails":  atomic.LoadInt64(&s.authFails),
+		"errors":      atomic.LoadInt64(&s.errorCount),
+		"bytes_sent":  atomic.LoadInt64(&s.bytesSent),
+		"bytes_recv":  atomic.LoadInt64(&s.bytesRecv),
+		"uptime_secs": int64(time.Since(s.startTime).Seconds()),
+		"worker_cap":  cap(s.workerPool),
+		"max_conns":   maxIdleConns,
 	}
 }

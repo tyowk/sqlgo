@@ -1,4 +1,4 @@
-package auth
+package connector
 
 import (
 	"bufio"
@@ -152,26 +152,23 @@ func LoadCredential(path string) (*Credential, error) {
 }
 
 func ServerHandshake(conn net.Conn, cred *Credential) error {
-	if cred.Mode == ModeNone {
-		return nil
-	}
-
 	conn.SetDeadline(time.Now().Add(authTimeout))
 	defer conn.SetDeadline(time.Time{})
 
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 4096), 4096)
 	enc := json.NewEncoder(conn)
+	scanner := bufio.NewScanner(conn)
 
 	challenge := map[string]interface{}{
 		"version": protoVersion,
 		"mode":    string(cred.Mode),
-		"require": true,
+		"require": cred.Mode != ModeNone,
 	}
 	if err := enc.Encode(challenge); err != nil {
 		return fmt.Errorf("auth challenge send failed: %w", err)
 	}
-
+	if cred.Mode == ModeNone {
+		return nil
+	}
 	if !scanner.Scan() {
 		return fmt.Errorf("client disconnected during auth")
 	}
@@ -232,6 +229,7 @@ func ClientHandshake(conn net.Conn, password, token string) error {
 	if !resp.OK {
 		return fmt.Errorf("auth rejected: %s", resp.Message)
 	}
+
 	return nil
 }
 
